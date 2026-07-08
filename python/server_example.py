@@ -1,92 +1,171 @@
-from cloudlink import server
+"""
+CloudLink/FEL server ready for TurboWarp.
+
+Features enabled by loading the built-in CLPv4 protocol:
+- handshake, ping, setid
+- global/private messages: gmsg, pmsg
+- global/private variables: gvar, pvar
+- rooms: link, unlink, per-packet room selection
+- direct messages
+- user lists, client object, server version, optional MOTD
+
+Run:
+    python server_example.py
+Then connect TurboWarp to:
+    ws://127.0.0.1:3000
+"""
+
+import json
+import logging
+import os
+import sys
+import warnings
+from pathlib import Path
+
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+)
+
+VENDOR_DIR = Path(__file__).with_name("cloudlink_vendor")
+if VENDOR_DIR.exists():
+    sys.path.insert(0, str(VENDOR_DIR))
+
+from cloudlink import server as CloudLinkServer
 from cloudlink.server.protocols import clpv4, scratch
-import asyncio
 
 
-class example_callbacks:
-    def __init__(self, parent):
-        self.parent = parent
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "3000"))
+LOG_LEVEL = logging.INFO
 
-    async def test1(self, client, message):
-        print("Test1!")
-        await asyncio.sleep(1)
-        print("Test1 after one second!")
-    
-    async def test2(self, client, message):
-        print("Test2!")
-        await asyncio.sleep(1)
-        print("Test2 after one second!")
-    
-    async def test3(self, client, message):
-        print("Test3!")
+# Set this to False if you want data packets to preserve object/list values.
+# Keeping it True prevents old Scratch/TurboWarp projects from displaying
+# objects as "[object Object]" when a JSON object is sent as message/variable data.
+STRINGIFY_DATA_OBJECTS = True
+
+# Optional server greeting shown after handshake.
+ENABLE_MOTD = True
+MOTD_MESSAGE = "Bienvenue sur le serveur FEL CloudLink."
 
 
-class example_commands:
-    def __init__(self, parent, protocol):
-        
-        # Creating custom commands - This example adds a custom command called "foobar".
-        @server.on_command(cmd="foobar", schema=protocol.schema)
-        async def foobar(client, message):
-            print("Foobar!")
-
-            # Reading the IP address of the client is as easy as calling get_client_ip from the clpv4 protocol object.
-            print(protocol.get_client_ip(client))
-
-            # In case you need to report a status code, use send_statuscode.
-            protocol.send_statuscode(
-                client=client,
-                code=protocol.statuscodes.ok,
-                message=message
-            )
+DATA_COMMANDS = {"gmsg", "pmsg", "gvar", "pvar", "direct"}
 
 
-class example_events:
-    def __init__(self):
-        pass
+def make_json_safe(value):
+    """Convert Python-only containers into JSON-compatible values."""
+    if isinstance(value, set):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, list):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    return value
 
-    async def on_close(self, client):
-        print("Client", client.id, "disconnected.")
 
+def stringify_if_object(value):
+    """Return objects/lists as compact JSON text for Scratch-safe reporters."""
+    value = make_json_safe(value)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return value
+
+
+def patch_outgoing_packets(app):
+    """Normalize outgoing packets and optionally fix object-valued data packets."""
+    original_execute_unicast = app.execute_unicast
+
+    async def execute_unicast_compat(client, message):
+        if isinstance(message, dict):
+            message = make_json_safe(message)
+
+            if STRINGIFY_DATA_OBJECTS and message.get("cmd") in DATA_COMMANDS:
+                if "val" in message:
+                    message["val"] = stringify_if_object(message["val"])
+
+        await original_execute_unicast(client, message)
+
+    app.execute_unicast = execute_unicast_compat
+
+
+def patch_user_object_lookup(app):
+    """Allow private recipients to be passed as CloudLink user objects."""
+    original_room_find_obj = app.rooms_manager.find_obj
+    original_client_find_obj = app.clients_manager.find_obj
+
+    def identity_candidates(query):
+        if isinstance(query, dict):
+            for key in ("id", "uuid", "username"):
+                value = query.get(key)
+                if value is not None and str(value):
+                    yield str(value)
+        else:
+            yield query
+
+    def room_find_obj_compat(query, room):
+        last_error = None
+        for candidate in identity_candidates(query):
+            try:
+                return original_room_find_obj(candidate, room)
+            except Exception as error:
+                last_error = error
+        if last_error:
+            raise last_error
+        raise app.rooms_manager.exceptions.NoResultsFound
+
+    def client_find_obj_compat(query):
+        last_error = None
+        for candidate in identity_candidates(query):
+            try:
+                return original_client_find_obj(candidate)
+            except Exception as error:
+                last_error = error
+        if last_error:
+            raise last_error
+        raise app.clients_manager.exceptions.NoResultsFound
+
+    app.rooms_manager.find_obj = room_find_obj_compat
+    app.clients_manager.find_obj = client_find_obj_compat
+
+
+class ServerEvents:
     async def on_connect(self, client):
-        print("Client", client.id, "connected.") 
+        print(f"Client {client.snowflake} connected.")
+
+    async def on_disconnect(self, client):
+        print(f"Client {client.snowflake} disconnected.")
+
+    async def on_error(self, client, error):
+        print(f"Client {getattr(client, 'snowflake', '?')} error: {error}")
 
 
 if __name__ == "__main__":
-    # Initialize the server
-    server = server()
-    
-    # Configure logging settings
-    server.logging.basicConfig(
-        level=server.logging.DEBUG
+    app = CloudLinkServer()
+
+    app.logging.basicConfig(
+        level=LOG_LEVEL,
+        format="[%(levelname)s] %(message)s"
     )
 
-    # Load protocols
-    clpv4 = clpv4(server)
-    scratch = scratch(server)
+    # Load full CloudLink v4 and Scratch cloud-variable support.
+    cl4 = clpv4(app)
+    scratch(app)
 
-    # Load examples
-    callbacks = example_callbacks(server)
-    commands = example_commands(server, clpv4)
-    events = example_events()
+    cl4.enable_motd = ENABLE_MOTD
+    cl4.motd_message = MOTD_MESSAGE
 
-    # Binding callbacks - This example binds the "handshake" command with example callbacks.
-    # You can bind as many functions as you want to a callback, but they must use async.
-    # To bind callbacks to built-in methods (example: gmsg), see cloudlink.cl_methods.
-    server.bind_callback(cmd="handshake", schema=clpv4.schema, method=callbacks.test1)
-    server.bind_callback(cmd="handshake", schema=clpv4.schema, method=callbacks.test2)
+    patch_outgoing_packets(app)
+    patch_user_object_lookup(app)
 
-    # Binding events - This example will print a client connect/disconnect message.
-    # You can bind as many functions as you want to an event, but they must use async.
-    # To see all possible events for the server, see cloudlink.events.
-    server.bind_event(server.on_connect, events.on_connect)
-    server.bind_event(server.on_disconnect, events.on_close)
+    events = ServerEvents()
+    app.bind_event(app.on_connect, events.on_connect)
+    app.bind_event(app.on_disconnect, events.on_disconnect)
+    app.bind_event(app.on_error, events.on_error)
 
-    # You can also bind an event to a custom command. We'll bind callbacks.test3 to our 
-    # foobar command from earlier.
-    server.bind_callback(cmd="foobar", schema=clpv4.schema, method=callbacks.test3)
-
-    # Initialize SSL support
-    # server.enable_ssl(certfile="cert.pem", keyfile="privkey.pem")
-    
-    # Start the server
-    server.run(ip="0.0.0.0", port=3000)
+    print(f"FEL CloudLink server listening on {HOST}:{PORT}")
+    print("Local TurboWarp URL: ws://127.0.0.1:3000")
+    print("Render URL: wss://<your-render-service>.onrender.com")
+    app.run(ip=HOST, port=PORT)
