@@ -131,6 +131,23 @@ def patch_outgoing_packets(app):
     app.execute_unicast = execute_unicast_compat
 
 
+def patch_incoming_packets(app):
+    """Log incoming packets before validation so rejected packets are visible."""
+    original_message_processor = app.message_processor
+
+    async def message_processor_compat(client, message):
+        if LOG_PACKETS:
+            try:
+                parsed = app.ujson.loads(message)
+            except Exception:
+                parsed = message
+            log(f"RX <- {client_label(client)} {packet_summary(parsed)}")
+
+        await original_message_processor(client, message)
+
+    app.message_processor = message_processor_compat
+
+
 def patch_user_object_lookup(app):
     """Allow private recipients to be passed as CloudLink user objects."""
     original_room_find_obj = app.rooms_manager.find_obj
@@ -184,10 +201,6 @@ class ServerEvents:
     async def on_error(self, client, error):
         log(f"ERROR {client_label(client)} {error}", "ERROR")
 
-    async def on_message(self, client, message):
-        if LOG_PACKETS:
-            log(f"RX <- {client_label(client)} {packet_summary(message)}")
-
 
 if __name__ == "__main__":
     app = CloudLinkServer()
@@ -206,13 +219,13 @@ if __name__ == "__main__":
     cl4.motd_message = MOTD_MESSAGE
 
     patch_outgoing_packets(app)
+    patch_incoming_packets(app)
     patch_user_object_lookup(app)
 
     events = ServerEvents()
     app.bind_event(app.on_connect, events.on_connect)
     app.bind_event(app.on_disconnect, events.on_disconnect)
     app.bind_event(app.on_error, events.on_error)
-    app.bind_event(app.on_message, events.on_message)
 
     log(f"FEL CloudLink server listening on {HOST}:{PORT}")
     log("Local TurboWarp URL: ws://127.0.0.1:3000")

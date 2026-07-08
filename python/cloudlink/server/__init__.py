@@ -358,6 +358,15 @@ class server:
             # End message_processor coroutine
             return
 
+        # Scratch/TurboWarp projects sometimes send variable names as numbers,
+        # booleans, or parsed JSON values. CLPv4 expects the "name" field to be
+        # a string, so normalize it before Cerberus validation rejects the packet.
+        if type(message) == dict and "name" in message and type(message["name"]) != str:
+            try:
+                message["name"] = self.ujson.dumps(message["name"])
+            except Exception:
+                message["name"] = str(message["name"])
+
         # Begin validation
         valid = False
         selected_protocol = None
