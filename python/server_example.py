@@ -38,7 +38,8 @@ from cloudlink.server.protocols import clpv4, scratch
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "3000"))
-LOG_LEVEL = logging.INFO
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_PACKETS = os.environ.get("LOG_PACKETS", "1").lower() not in {"0", "false", "no"}
 
 # Set this to False if you want data packets to preserve object/list values.
 # Keeping it True prevents old Scratch/TurboWarp projects from displaying
@@ -51,6 +52,42 @@ MOTD_MESSAGE = "Bienvenue sur le serveur FEL CloudLink."
 
 
 DATA_COMMANDS = {"gmsg", "pmsg", "gvar", "pvar", "direct"}
+NOISY_KEYS = {"val", "details"}
+
+
+def log(message, level="INFO"):
+    print(f"[{level}] {message}", flush=True)
+
+
+def short(value, max_len=180):
+    text = repr(value)
+    if len(text) > max_len:
+        return f"{text[:max_len]}..."
+    return text
+
+
+def packet_summary(message):
+    if not isinstance(message, dict):
+        return short(message)
+
+    parts = [f"cmd={message.get('cmd') or message.get('method')!r}"]
+    for key in ("listener", "name", "id", "rooms", "mode", "code", "code_id"):
+        if key in message:
+            parts.append(f"{key}={short(message[key], 80)}")
+    for key in NOISY_KEYS:
+        if key in message:
+            parts.append(f"{key}={short(message[key])}")
+    return " ".join(parts)
+
+
+def client_label(client):
+    snowflake = getattr(client, "snowflake", "?")
+    username = getattr(client, "username", "")
+    protocol = getattr(getattr(client, "protocol", None), "__qualname__", "unknown")
+    rooms = sorted(getattr(client, "rooms", []))
+    if username:
+        return f"{snowflake}/{username} protocol={protocol} rooms={rooms}"
+    return f"{snowflake} protocol={protocol} rooms={rooms}"
 
 
 def make_json_safe(value):
@@ -85,6 +122,9 @@ def patch_outgoing_packets(app):
             if STRINGIFY_DATA_OBJECTS and message.get("cmd") in DATA_COMMANDS:
                 if "val" in message:
                     message["val"] = stringify_if_object(message["val"])
+
+        if LOG_PACKETS:
+            log(f"TX -> {client_label(client)} {packet_summary(message)}")
 
         await original_execute_unicast(client, message)
 
@@ -133,13 +173,20 @@ def patch_user_object_lookup(app):
 
 class ServerEvents:
     async def on_connect(self, client):
-        print(f"Client {client.snowflake} connected.")
+        peer = getattr(client, "remote_address", "?")
+        headers = getattr(client, "request_headers", {})
+        origin = headers.get("origin", "?") if hasattr(headers, "get") else "?"
+        log(f"CONNECT {client.snowflake} peer={peer} origin={origin}")
 
     async def on_disconnect(self, client):
-        print(f"Client {client.snowflake} disconnected.")
+        log(f"DISCONNECT {client_label(client)}")
 
     async def on_error(self, client, error):
-        print(f"Client {getattr(client, 'snowflake', '?')} error: {error}")
+        log(f"ERROR {client_label(client)} {error}", "ERROR")
+
+    async def on_message(self, client, message):
+        if LOG_PACKETS:
+            log(f"RX <- {client_label(client)} {packet_summary(message)}")
 
 
 if __name__ == "__main__":
@@ -147,7 +194,8 @@ if __name__ == "__main__":
 
     app.logging.basicConfig(
         level=LOG_LEVEL,
-        format="[%(levelname)s] %(message)s"
+        format="[%(levelname)s] %(message)s",
+        force=True
     )
 
     # Load full CloudLink v4 and Scratch cloud-variable support.
@@ -164,8 +212,10 @@ if __name__ == "__main__":
     app.bind_event(app.on_connect, events.on_connect)
     app.bind_event(app.on_disconnect, events.on_disconnect)
     app.bind_event(app.on_error, events.on_error)
+    app.bind_event(app.on_message, events.on_message)
 
-    print(f"FEL CloudLink server listening on {HOST}:{PORT}")
-    print("Local TurboWarp URL: ws://127.0.0.1:3000")
-    print("Render URL: wss://<your-render-service>.onrender.com")
+    log(f"FEL CloudLink server listening on {HOST}:{PORT}")
+    log("Local TurboWarp URL: ws://127.0.0.1:3000")
+    log("Render URL: wss://<your-render-service>.onrender.com")
+    log(f"Packet logs: {'enabled' if LOG_PACKETS else 'disabled'}")
     app.run(ip=HOST, port=PORT)

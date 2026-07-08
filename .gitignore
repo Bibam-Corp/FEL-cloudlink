@@ -1,5 +1,6 @@
 __pycache__
 .vscode
+python/cloudlink_vendor/
 *.bak
 .idea
 *.exe

@@ -678,6 +678,10 @@ class server:
         # Attempt to send the packet
         try:
             await client.send(message)
+        except self.ws.exceptions.ConnectionClosed:
+            self.logger.info(
+                f"Skipped sending message to closed client {client.snowflake}"
+            )
         except Exception as e:
             self.logger.critical(
                 f"Unexpected exception was raised while sending message to client {client.snowflake}: {e}"
